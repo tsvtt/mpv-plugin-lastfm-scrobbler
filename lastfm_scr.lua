@@ -32,6 +32,7 @@ API_METHODS = {
     getSession = 'auth.getSession',
     getToken = 'auth.gettoken',
     scrobble = 'track.scrobble',
+    nowPlaying = 'track.updateNowPlaying'
 }
 
 subpr_cmd_table = {
@@ -133,27 +134,27 @@ end
 
 
 ---@param method string
----@param token string
 ---@param params table
 ---@return string?
-function gen_sig(method, token, params)
-    local sig = 'api_key' .. K
-
-    if method == API_METHODS.getSession then
-        sig = sig .. 'method' .. method .. 'token' .. token
-    elseif method == API_METHODS.scrobble then
-        sig =
-			'albumArtist[0]' .. params['albumArtist[0]'] ..
-            'album[0]' .. params['album[0]'] ..
-            sig ..
-            'artist[0]' .. params['artist[0]'] ..
-            'method' .. method ..
-            'sk' .. sk ..
-            'timestamp[0]' .. params['timestamp[0]'] ..
-            'track[0]' .. params['track[0]']
-    else
+function gen_sig(method, params)
+    local sig = ''
+    --validate api method
+    local valid_method = false
+    for k,v in pairs(API_METHODS) do
+        if method == v then
+            logger.debug('Valid method:', method)
+            valid_method = true
+        end
+    end
+    if not valid_method then
         logger.error('Incorrect method:', method)
         return
+    end
+    --go through params in alpha sorted order and append to sig
+    local ordered_params = table_alpha_sorted(params)
+    for i,k in ipairs(ordered_params) do
+        sig = sig .. k .. params[k]
+        logger.debug(k, ": ", params[k])
     end
     sig = sig .. S
     logger.debug('Generated sig: ', sig)
@@ -171,18 +172,29 @@ function new_session_notify_user(token)
     run_subpr_async({ 'xdg-open', url })
 end
 
-function api_fetch_session(token, sig)
-    local url = URL_K .. '&method=' .. API_METHODS.getSession .. '&token=' .. token .. '&api_sig=' .. sig
+function api_fetch_session(token)
+    local url = URL_K .. '&method=' .. API_METHODS.getSession .. '&token=' .. token
     logger.debug('Requesting URL:', url)
     return curl_get(url).stdout
 end
 
-function table_to_urlencoded(table)
+function table_to_urlencoded(t)
     local s = ''
-    for k, v in pairs(table) do
+    for k, v in pairs(t) do
         s = s .. k .. '=' .. v .. '&'
     end
     return s:sub(0, s:len() - 1)
+end
+
+function table_alpha_sorted(t)
+    local i = 1
+    local sorted_table = {}
+    for k,v in pairs(t) do
+        sorted_table[i] = k
+        i = i + 1
+    end
+    table.sort(sorted_table)
+    return sorted_table
 end
 
 function extract_playmetadata()
@@ -190,13 +202,34 @@ function extract_playmetadata()
         artist = mp.get_property("metadata/by-key/artist") or '',
         title = mp.get_property("metadata/by-key/title") or '',
         album = mp.get_property("metadata/by-key/album") or '',
-		albumArtist = mp.get_property("metadata/by-key/album_artist") or mp.get_property("metadata/by-key/album artist") or '',
+        albumArtist = mp.get_property("metadata/by-key/album_artist") or mp.get_property("metadata/by-key/album artist") or '',
     }
 end
 
 function filename() return mp.get_property('filename') end
 function file_ext() return filename():match('%.(%w+)$') end
 
+function now_playing()
+    -- basically copied from scrobble function, updates nowPlaying
+    local md = extract_playmetadata()
+    local api_params = {
+                ['album'] = repl_api_broken_chars(md.album),
+                api_key = K,
+                method = API_METHODS.nowPlaying,
+                sk = sk,
+                ['artist'] = repl_api_broken_chars(md.artist),
+                ['track'] = repl_api_broken_chars(md.title),
+                ['albumArtist'] = repl_api_broken_chars(md.albumArtist),
+    }
+    api_params.api_sig = gen_sig(API_METHODS.nowPlaying, api_params)
+    if empty(api_params.api_sig) or empty(md.artist) or empty(md.title) then
+        logger.error("Can't nowPlaying: empty value among required values:",
+            'sig=', api_params.api_sig, ',artist=', md.artist, ',title=', md.title)
+        return
+    end
+    local res = curl_post(SCR_URL, table_to_urlencoded(api_params))
+    if IS_FILELOG_SCR and res.status == 0 then filelog_scr(md) end
+end
 
 ---@param timeout number
 function scrobble(timeout)
@@ -209,9 +242,9 @@ function scrobble(timeout)
                 ['artist[0]'] = repl_api_broken_chars(md.artist),
                 ['timestamp[0]'] = os.time() - timeout,
                 ['track[0]'] = repl_api_broken_chars(md.title),
-				['albumArtist[0]'] = repl_api_broken_chars(md.albumArtist),
+                ['albumArtist[0]'] = repl_api_broken_chars(md.albumArtist),
     }
-    api_params.api_sig = gen_sig(API_METHODS.scrobble, '', api_params)
+    api_params.api_sig = gen_sig(API_METHODS.scrobble, api_params)
     if empty(api_params.api_sig) or empty(md.artist) or empty(md.title) then
         logger.error("Can't scrobble: empty value among required values:",
             'sig=', api_params.api_sig, ',artist=', md.artist, ',title=', md.title)
@@ -238,8 +271,10 @@ function set_scrobble_timer()
     if SCR_FORMATS[file_ext()] then
         local timeout = calc_scr_timeout()
         timer = mp.add_timeout(timeout, function() scrobble(timeout) end)
+        playing_timeout = mp.add_timeout(5, function() now_playing() end)
         if is_paused then
             timer:stop()
+            playing_timeout:stop()
         end
     else
         logger.debug('Extension "' .. file_ext() .. '" is not set for scrobbling')
@@ -267,11 +302,11 @@ function on_file_ended(ev)
 end
 
 function on_pause(_name, is_paused_ev)
-	if is_paused_ev == true then
-	    is_paused = true
-	    if timer then timer:stop() end
+    if is_paused_ev == true then
+        is_paused = true
+        if timer then timer:stop() end
     else
-	    is_paused = false
+        is_paused = false
         if timer then timer:resume() end
     end
 end
@@ -283,11 +318,11 @@ function init_mpv_handlers()
     mp.observe_property("pause", "bool", on_pause)
 end
 
-function wait_session_approve(token, sig)
+function wait_session_approve(token)
     local times = 15
 
     function fetch_creds()
-        local session_resp = api_fetch_session(token, sig)
+        local session_resp = api_fetch_session(token)
         if session_resp then
             uname = session_resp:match('name' .. JSON_VALUE_RE)
             sk = session_resp:match('key' .. JSON_VALUE_RE)
@@ -344,15 +379,8 @@ function setup_userdata()
         logger.error('token is nil')
         return
     end
-
-    local sig = gen_sig(API_METHODS.getSession, token, {})
-    if not sig then
-        logger.error('sig is nil')
-        return
-    end
-
     new_session_notify_user(token)
-    wait_session_approve(token, sig)
+    wait_session_approve(token)
     if not sk then
         logger.error('sk is nil')
         return
